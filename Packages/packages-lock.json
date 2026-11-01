@@ -43,7 +43,7 @@
     },
     "com.unity.burst": {
       "version": "2.0.0",
-      "depth": 2,
+      "depth": 1,
       "source": "builtin",
       "dependencies": {}
     },
@@ -156,6 +156,20 @@
       "depth": 1,
       "source": "registry",
       "dependencies": {},
+      "url": "https://packages.unity.com"
+    },
+    "com.unity.pipeline": {
+      "version": "0.9.1-exp.1",
+      "depth": 0,
+      "source": "registry",
+      "dependencies": {
+        "com.unity.test-framework": "1.1.33",
+        "com.unity.nuget.mono-cecil": "1.11.6",
+        "com.unity.modules.uielements": "1.0.0",
+        "com.unity.modules.jsonserialize": "1.0.0",
+        "com.unity.modules.screencapture": "1.0.0",
+        "com.unity.nuget.newtonsoft-json": "3.0.2"
+      },
       "url": "https://packages.unity.com"
     },
     "com.unity.profiling.core": {
@@ -401,6 +415,16 @@
         "com.unity.xr.legacyinputhelpers": "2.1.2"
       },
       "url": "https://packages.unity.com"
+    },
+    "org.nesnausk.gaussian-splatting": {
+      "version": "file:org.nesnausk.gaussian-splatting",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {
+        "com.unity.burst": "1.8.8",
+        "com.unity.collections": "2.1.4",
+        "com.unity.mathematics": "1.2.6"
+      }
     },
     "com.unity.modules.accessibility": {
       "version": "1.0.0",

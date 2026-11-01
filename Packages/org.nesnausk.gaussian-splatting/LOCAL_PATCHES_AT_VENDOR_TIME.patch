@@ -1,0 +1,1209 @@
+diff --git a/package/Runtime/GaussianSplatRenderer.cs b/package/Runtime/GaussianSplatRenderer.cs
+index 9e080b9..ca528ab 100644
+--- a/package/Runtime/GaussianSplatRenderer.cs
++++ b/package/Runtime/GaussianSplatRenderer.cs
+@@ -74,15 +74,42 @@ namespace GaussianSplatting.Runtime
+         {
+             if (cam.cameraType == CameraType.Preview)
+                 return false;
++            if (cam.cameraType == CameraType.Reflection)
++                return false;
++
++            // Exclude OVROverlayCanvas or other UI/overlay cameras that render to textures
++            if (cam.cameraType == CameraType.Game && !cam.CompareTag("MainCamera"))
++            {
++                if (cam.targetTexture != null ||
++                    cam.name.Contains("Canvas") || cam.name.Contains("OVR") ||
++                    cam.gameObject.name.Contains("Canvas") || cam.gameObject.name.Contains("OVR"))
++                {
++                    return false;
++                }
++            }
++            
++            //Debug.Log($"[GaussianSplatRenderSystem] GatherSplatsForCamera for {cam.name}: total registered splats={m_Splats.Count}");
++            
+             // gather all active & valid splat objects
+             m_ActiveSplats.Clear();
+             foreach (var kvp in m_Splats)
+             {
+                 var gs = kvp.Key;
+-                if (gs == null || !gs.isActiveAndEnabled || !gs.HasValidAsset || !gs.HasValidRenderSetup)
++                if (gs == null)
++                {
++                    //Debug.Log($"[GaussianSplatRenderSystem] Splat reference is null");
++                    continue;
++                }
++                
++                //Debug.Log($"[GaussianSplatRenderSystem] Checking splat {gs.name}: activeAndEnabled={gs.isActiveAndEnabled}, HasValidAsset={gs.HasValidAsset}, HasValidRenderSetup={gs.HasValidRenderSetup}");
++                
++                if (!gs.isActiveAndEnabled || !gs.HasValidAsset || !gs.HasValidRenderSetup)
+                     continue;
+                 m_ActiveSplats.Add((kvp.Key, kvp.Value));
+             }
++            
++            //Debug.Log($"[GaussianSplatRenderSystem] Gathered {m_ActiveSplats.Count} valid active splats for camera {cam.name}");
++            
+             if (m_ActiveSplats.Count == 0)
+                 return false;
+ 
+@@ -147,6 +174,21 @@ namespace GaussianSplatting.Runtime
+                 mpb.SetInteger(GaussianSplatRenderer.Props.SHOnly, gs.m_SHOnly ? 1 : 0);
+                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayIndex, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugPointIndices ? 1 : 0);
+                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 1 : 0);
++                mpb.SetInteger(GaussianSplatRenderer.Props.ViewDataOffset, 0);
++
++                // Set on Material directly for Vulkan StructuredBuffer compatibility
++                gs.SetAssetDataOnMaterial(displayMat);
++                displayMat.SetBuffer(GaussianSplatRenderer.Props.SplatChunks, gs.m_GpuChunks);
++                displayMat.SetBuffer(GaussianSplatRenderer.Props.SplatViewData, gs.m_GpuView);
++                displayMat.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer, gs.m_GpuSortKeys);
++                displayMat.SetFloat(GaussianSplatRenderer.Props.SplatScale, gs.m_SplatScale);
++                displayMat.SetFloat(GaussianSplatRenderer.Props.SplatOpacityScale, gs.m_OpacityScale);
++                displayMat.SetFloat(GaussianSplatRenderer.Props.SplatSize, gs.m_PointDisplaySize);
++                displayMat.SetInteger(GaussianSplatRenderer.Props.SHOrder, gs.m_SHOrder);
++                displayMat.SetInteger(GaussianSplatRenderer.Props.SHOnly, gs.m_SHOnly ? 1 : 0);
++                displayMat.SetInteger(GaussianSplatRenderer.Props.DisplayIndex, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugPointIndices ? 1 : 0);
++                displayMat.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 1 : 0);
++                displayMat.SetInteger(GaussianSplatRenderer.Props.ViewDataOffset, 0);
+ 
+                 cmb.BeginSample(s_ProfCalcView);
+                 gs.CalcViewData(cmb, cam);
+@@ -168,6 +210,90 @@ namespace GaussianSplatting.Runtime
+             return matComposite;
+         }
+ 
++        // Stereo XR variant: renders all active splats for a single eye, with explicit per-eye
++        // view/projection matrices and a per-eye write offset into the (doubled) view-data buffer.
++        // Used by the URP feature in single-pass instanced VR where DrawProcedural cannot participate
++        // in Unity's automatic stereo instancing.
++        // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features for stereo XR
++        public Material SortAndRenderSplatsForEye(Camera cam, CommandBuffer cmb, int eyeIndex, Matrix4x4 viewMatrix, Matrix4x4 projMatrix, Vector3 eyePos)
++        {
++            Material matComposite = null;
++            foreach (var kvp in m_ActiveSplats)
++            {
++                var gs = kvp.Item1;
++                int viewDataOffset = eyeIndex * gs.splatCount;
++                gs.EnsureMaterials();
++                matComposite = gs.m_MatComposite;
++                var mpb = kvp.Item2;
++
++                // sort once per frame using the center/this-eye camera (depth ordering is shared between eyes)
++                var matrix = gs.transform.localToWorldMatrix;
++                if (eyeIndex == 0)
++                {
++                    if (gs.m_FrameCounter % gs.m_SortNthFrame == 0)
++                        gs.SortPoints(cmb, cam, matrix);
++                    ++gs.m_FrameCounter;
++                }
++
++                kvp.Item2.Clear();
++                Material displayMat = gs.m_RenderMode switch
++                {
++                    GaussianSplatRenderer.RenderMode.DebugPoints => gs.m_MatDebugPoints,
++                    GaussianSplatRenderer.RenderMode.DebugPointIndices => gs.m_MatDebugPoints,
++                    GaussianSplatRenderer.RenderMode.DebugBoxes => gs.m_MatDebugBoxes,
++                    GaussianSplatRenderer.RenderMode.DebugChunkBounds => gs.m_MatDebugBoxes,
++                    _ => gs.m_MatSplats
++                };
++                if (displayMat == null)
++                    continue;
++
++                gs.SetAssetDataOnMaterial(mpb);
++                mpb.SetBuffer(GaussianSplatRenderer.Props.SplatChunks, gs.m_GpuChunks);
++                mpb.SetBuffer(GaussianSplatRenderer.Props.SplatViewData, gs.m_GpuView);
++                mpb.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer, gs.m_GpuSortKeys);
++                mpb.SetFloat(GaussianSplatRenderer.Props.SplatScale, gs.m_SplatScale);
++                mpb.SetFloat(GaussianSplatRenderer.Props.SplatOpacityScale, gs.m_OpacityScale);
++                mpb.SetFloat(GaussianSplatRenderer.Props.SplatSize, gs.m_PointDisplaySize);
++                mpb.SetInteger(GaussianSplatRenderer.Props.SHOrder, gs.m_SHOrder);
++                mpb.SetInteger(GaussianSplatRenderer.Props.SHOnly, gs.m_SHOnly ? 1 : 0);
++                mpb.SetInteger(GaussianSplatRenderer.Props.DisplayIndex, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugPointIndices ? 1 : 0);
++                mpb.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 1 : 0);
++                mpb.SetInteger(GaussianSplatRenderer.Props.ViewDataOffset, viewDataOffset);
++
++                // Set on Material directly for Vulkan StructuredBuffer compatibility
++                gs.SetAssetDataOnMaterial(displayMat);
++                displayMat.SetBuffer(GaussianSplatRenderer.Props.SplatChunks, gs.m_GpuChunks);
++                displayMat.SetBuffer(GaussianSplatRenderer.Props.SplatViewData, gs.m_GpuView);
++                displayMat.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer, gs.m_GpuSortKeys);
++                displayMat.SetFloat(GaussianSplatRenderer.Props.SplatScale, gs.m_SplatScale);
++                displayMat.SetFloat(GaussianSplatRenderer.Props.SplatOpacityScale, gs.m_OpacityScale);
++                displayMat.SetFloat(GaussianSplatRenderer.Props.SplatSize, gs.m_PointDisplaySize);
++                displayMat.SetInteger(GaussianSplatRenderer.Props.SHOrder, gs.m_SHOrder);
++                displayMat.SetInteger(GaussianSplatRenderer.Props.SHOnly, gs.m_SHOnly ? 1 : 0);
++                displayMat.SetInteger(GaussianSplatRenderer.Props.DisplayIndex, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugPointIndices ? 1 : 0);
++                displayMat.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 1 : 0);
++                displayMat.SetInteger(GaussianSplatRenderer.Props.ViewDataOffset, viewDataOffset);
++
++                cmb.BeginSample(s_ProfCalcView);
++                gs.CalcViewDataForEye(cmb, viewMatrix, projMatrix, eyePos, viewDataOffset);
++                cmb.EndSample(s_ProfCalcView);
++
++                // draw
++                int indexCount = 6;
++                int instanceCount = gs.splatCount;
++                MeshTopology topology = MeshTopology.Triangles;
++                if (gs.m_RenderMode is GaussianSplatRenderer.RenderMode.DebugBoxes or GaussianSplatRenderer.RenderMode.DebugChunkBounds)
++                    indexCount = 36;
++                if (gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds)
++                    instanceCount = gs.m_GpuChunksValid ? gs.m_GpuChunks.count : 0;
++
++                cmb.BeginSample(s_ProfDraw);
++                cmb.DrawProcedural(gs.m_GpuIndexBuffer, matrix, displayMat, 0, topology, indexCount, instanceCount, mpb);
++                cmb.EndSample(s_ProfDraw);
++            }
++            return matComposite;
++        }
++
+         // ReSharper disable once MemberCanBePrivate.Global - used by HDRP/URP features that are not always compiled
+         // ReSharper disable once UnusedMethodReturnValue.Global - used by HDRP/URP features that are not always compiled
+         public CommandBuffer InitialClearCmdBuffer(Camera cam)
+@@ -199,6 +325,12 @@ namespace GaussianSplatting.Runtime
+             // way only works in BiRP so only do it here.
+             m_CommandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.CameraTargetTexture, BuiltinRenderTextureType.CameraTarget);
+ 
++            Matrix4x4 gpuProjScreen = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false);
++            Matrix4x4 gpuProjTexture = GL.GetGPUProjectionMatrix(cam.projectionMatrix, true);
++            bool projectionMismatched = (gpuProjScreen.m11 * gpuProjTexture.m11 < 0.0f);
++            float flipY = (cam.cameraType != CameraType.SceneView && cam.cameraType != CameraType.Preview && projectionMismatched) ? 1.0f : 0.0f;
++            m_CommandBuffer.SetGlobalFloat(GaussianSplatRenderer.Props.SplatFlipY, flipY);
++
+             // add sorting, view calc and drawing commands for each splat object
+             Material matComposite = SortAndRenderSplats(cam, m_CommandBuffer);
+ 
+@@ -262,6 +394,12 @@ namespace GaussianSplatting.Runtime
+         internal GraphicsBuffer m_GpuView;
+         internal GraphicsBuffer m_GpuIndexBuffer;
+ 
++        // Skinning (LBS)
++        GraphicsBuffer m_GpuSkinWeights;
++        bool m_SkinningEnabled;
++        Matrix4x4 m_BoneMatrixA = Matrix4x4.identity;
++        Matrix4x4 m_BoneMatrixB = Matrix4x4.identity;
++
+         // these buffers are only for splat editing, and are lazily created
+         GraphicsBuffer m_GpuEditCutouts;
+         GraphicsBuffer m_GpuEditCountsBounds;
+@@ -319,12 +457,23 @@ namespace GaussianSplatting.Runtime
+             public static readonly int MatrixWorldToObject = Shader.PropertyToID("_MatrixWorldToObject");
+             public static readonly int VecScreenParams = Shader.PropertyToID("_VecScreenParams");
+             public static readonly int VecWorldSpaceCameraPos = Shader.PropertyToID("_VecWorldSpaceCameraPos");
++            // ── Stereo XR (per-eye rendering) ─────────────────────
++            public static readonly int MatrixVPForEye = Shader.PropertyToID("_MatrixVPForEye");
++            public static readonly int MatrixPForEye = Shader.PropertyToID("_MatrixPForEye");
++            public static readonly int ViewDataOffset = Shader.PropertyToID("_ViewDataOffset");
++            public static readonly int UseEyeMatrices = Shader.PropertyToID("_UseEyeMatrices");
+             public static readonly int CameraTargetTexture = Shader.PropertyToID("_CameraTargetTexture");
++            public static readonly int SplatFlipY = Shader.PropertyToID("_SplatFlipY");
+             public static readonly int SelectionCenter = Shader.PropertyToID("_SelectionCenter");
+             public static readonly int SelectionDelta = Shader.PropertyToID("_SelectionDelta");
+             public static readonly int SelectionDeltaRot = Shader.PropertyToID("_SelectionDeltaRot");
+             public static readonly int SplatCutoutsCount = Shader.PropertyToID("_SplatCutoutsCount");
+             public static readonly int SplatCutouts = Shader.PropertyToID("_SplatCutouts");
++            // ── Skinning ─────────────────────────────────────────
++            public static readonly int BoneMatrixA = Shader.PropertyToID("_BoneMatrixA");
++            public static readonly int BoneMatrixB = Shader.PropertyToID("_BoneMatrixB");
++            public static readonly int SplatWeights = Shader.PropertyToID("_SplatWeights");
++            public static readonly int SkinWeightsValid = Shader.PropertyToID("_SkinWeightsValid");
+             public static readonly int SelectionMode = Shader.PropertyToID("_SelectionMode");
+             public static readonly int SplatPosMouseDown = Shader.PropertyToID("_SplatPosMouseDown");
+             public static readonly int SplatOtherMouseDown = Shader.PropertyToID("_SplatOtherMouseDown");
+@@ -338,6 +487,10 @@ namespace GaussianSplatting.Runtime
+ 
+         public GaussianSplatAsset asset => m_Asset;
+         public int splatCount => m_SplatCount;
++        public GraphicsBuffer gpuPosData => m_GpuPosData;
++        public GraphicsBuffer gpuOtherData => m_GpuOtherData;
++        public GraphicsBuffer gpuChunks => m_GpuChunks;
++        public bool gpuChunksValid => m_GpuChunksValid;
+ 
+         enum KernelIndices
+         {
+@@ -372,10 +525,77 @@ namespace GaussianSplatting.Runtime
+ 
+         void CreateResourcesForAsset()
+         {
++            //Debug.Log($"[GaussianSplatRenderer] CreateResourcesForAsset for {name}: m_Asset={m_Asset != null}, HasValidAsset={HasValidAsset}");
+             if (!HasValidAsset)
++            {
++                if (m_Asset != null)
++                {
++                    Debug.LogError($"[GaussianSplatRenderer] HasValidAsset is false on {name}! splatCount={m_Asset.splatCount}, formatVersion={m_Asset.formatVersion} (expected {GaussianSplatAsset.kCurrentVersion}), posData={m_Asset.posData != null}, otherData={m_Asset.otherData != null}, shData={m_Asset.shData != null}, colorData={m_Asset.colorData != null}");
++                }
++                return;
++            }
++
++            if (!CheckGpuBudget())
+                 return;
+ 
+             m_SplatCount = asset.splatCount;
++            try
++            {
++                CreateBuffersForAsset();
++            }
++            catch (Exception ex)
++            {
++                // Without this, a failed allocation part-way through leaves m_GpuChunks null, so
++                // HasValidRenderSetup goes false and the object is silently dropped from rendering.
++                Debug.LogError($"[GaussianSplatRenderer] Failed to allocate GPU resources for '{name}' (asset '{asset.name}', {asset.splatCount:N0} splats, {DescribeGpuBudget()}). This splat object will not render. Re-import the source PLY at a lower quality preset (Medium/Low) - the fully uncompressed 'VeryHigh' preset is desktop-only. Underlying error: {ex}");
++                DisposeResourcesForAsset();
++                return;
++            }
++
++            InitSortBuffers(splatCount);
++        }
++
++        // Largest single buffer this asset needs. Exceeding SystemInfo.maxGraphicsBufferSize is the
++        // usual reason an asset renders fine in the Editor but silently disappears on Quest/mobile,
++        // where the limit is far below the 2GB a desktop GPU reports.
++        long LargestBufferSize(out string which)
++        {
++            long shSize = asset.shData.dataSize;
++            long viewSize = (long)asset.splatCount * 2 * kGpuViewDataSize;
++            long posSize = asset.posData.dataSize;
++            long otherSize = asset.otherData.dataSize;
++
++            which = "SH"; long biggest = shSize;
++            if (viewSize > biggest) { which = "view"; biggest = viewSize; }
++            if (posSize > biggest) { which = "position"; biggest = posSize; }
++            if (otherSize > biggest) { which = "other"; biggest = otherSize; }
++            return biggest;
++        }
++
++        string DescribeGpuBudget()
++        {
++            const double kMB = 1024 * 1024;
++            long total = asset.posData.dataSize + asset.otherData.dataSize + asset.shData.dataSize +
++                         asset.colorData.dataSize + (long)asset.splatCount * 2 * kGpuViewDataSize +
++                         (long)asset.splatCount * 16;
++            long biggest = LargestBufferSize(out string which);
++            return $"~{total / kMB:F0}MB of GPU buffers, largest is the {which} buffer at {biggest / kMB:F0}MB; device max buffer size is {SystemInfo.maxGraphicsBufferSize / kMB:F0}MB";
++        }
++
++        bool CheckGpuBudget()
++        {
++            long maxBuf = SystemInfo.maxGraphicsBufferSize;
++            long biggest = LargestBufferSize(out string which);
++            if (maxBuf > 0 && biggest > maxBuf)
++            {
++                Debug.LogError($"[GaussianSplatRenderer] Asset '{asset.name}' on '{name}' needs a {which} buffer larger than this device supports ({DescribeGpuBudget()}). Refusing to allocate; this splat object will not render. Re-import the source PLY at a lower quality preset (Medium/Low) - the fully uncompressed 'VeryHigh' preset is desktop-only.");
++                return false;
++            }
++            return true;
++        }
++
++        void CreateBuffersForAsset()
++        {
+             m_GpuPosData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, (int) (asset.posData.dataSize / 4), 4) { name = "GaussianPosData" };
+             m_GpuPosData.SetData(asset.posData.GetData<uint>());
+             m_GpuOtherData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, (int) (asset.otherData.dataSize / 4), 4) { name = "GaussianOtherData" };
+@@ -384,7 +604,7 @@ namespace GaussianSplatting.Runtime
+             m_GpuSHData.SetData(asset.shData.GetData<uint>());
+             var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(asset.splatCount);
+             var texFormat = GaussianSplatAsset.ColorFormatToGraphics(asset.colorFormat);
+-            var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate) { name = "GaussianColorData" };
++            var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.DontUploadUponCreate) { name = "GaussianColorData" };
+             tex.SetPixelData(asset.colorData.GetData<byte>(), 0);
+             tex.Apply(false, true);
+             m_GpuColorData = tex;
+@@ -404,7 +624,8 @@ namespace GaussianSplatting.Runtime
+                 m_GpuChunksValid = false;
+             }
+ 
+-            m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_Asset.splatCount, kGpuViewDataSize);
++            // x2 size: holds view data for both stereo eyes (left = [0..count), right = [count..2*count))
++            m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_Asset.splatCount * 2, kGpuViewDataSize);
+             m_GpuIndexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Index, 36, 2);
+             // cube indices, most often we use only the first quad
+             m_GpuIndexBuffer.SetData(new ushort[]
+@@ -416,8 +637,6 @@ namespace GaussianSplatting.Runtime
+                 0, 4, 1, 4, 5, 1,
+                 2, 3, 6, 3, 7, 6
+             });
+-
+-            InitSortBuffers(splatCount);
+         }
+ 
+         void InitSortBuffers(int count)
+@@ -475,8 +694,14 @@ namespace GaussianSplatting.Runtime
+         public void OnEnable()
+         {
+             m_FrameCounter = 0;
++            bool supportsCompute = SystemInfo.supportsComputeShaders;
++            //Debug.Log($"[GaussianSplatRenderer] OnEnable for {name}: resourcesAreSetUp={resourcesAreSetUp}, supportsCompute={supportsCompute}, m_Asset={m_Asset != null}, m_ShaderSplats={m_ShaderSplats != null}, m_ShaderComposite={m_ShaderComposite != null}, m_ShaderDebugPoints={m_ShaderDebugPoints != null}, m_ShaderDebugBoxes={m_ShaderDebugBoxes != null}, m_CSSplatUtilities={m_CSSplatUtilities != null}");
++            
+             if (!resourcesAreSetUp)
++            {
++                Debug.LogError($"[GaussianSplatRenderer] resourcesAreSetUp check failed on {name}! m_ShaderSplats={m_ShaderSplats != null}, m_ShaderComposite={m_ShaderComposite != null}, m_ShaderDebugPoints={m_ShaderDebugPoints != null}, m_ShaderDebugBoxes={m_ShaderDebugBoxes != null}, m_CSSplatUtilities={m_CSSplatUtilities != null}, compute={supportsCompute}");
+                 return;
++            }
+ 
+             EnsureMaterials();
+             EnsureSorterAndRegister();
+@@ -524,6 +749,21 @@ namespace GaussianSplatting.Runtime
+             mat.SetInteger(Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
+         }
+ 
++        internal void SetAssetDataOnMaterial(Material mat)
++        {
++            mat.SetBuffer(Props.SplatPos, m_GpuPosData);
++            mat.SetBuffer(Props.SplatOther, m_GpuOtherData);
++            mat.SetBuffer(Props.SplatSH, m_GpuSHData);
++            mat.SetTexture(Props.SplatColor, m_GpuColorData);
++            mat.SetBuffer(Props.SplatSelectedBits, m_GpuEditSelected ?? m_GpuPosData);
++            mat.SetBuffer(Props.SplatDeletedBits, m_GpuEditDeleted ?? m_GpuPosData);
++            mat.SetInt(Props.SplatBitsValid, m_GpuEditSelected != null && m_GpuEditDeleted != null ? 1 : 0);
++            uint format = (uint)m_Asset.posFormat | ((uint)m_Asset.scaleFormat << 8) | ((uint)m_Asset.shFormat << 16);
++            mat.SetInteger(Props.SplatFormat, (int)format);
++            mat.SetInteger(Props.SplatCount, m_SplatCount);
++            mat.SetInteger(Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
++        }
++
+         static void DisposeBuffer(ref GraphicsBuffer buf)
+         {
+             buf?.Dispose();
+@@ -541,6 +781,7 @@ namespace GaussianSplatting.Runtime
+ 
+             DisposeBuffer(ref m_GpuView);
+             DisposeBuffer(ref m_GpuIndexBuffer);
++            DisposeBuffer(ref m_GpuSkinWeights);
+             DisposeBuffer(ref m_GpuSortDistances);
+             DisposeBuffer(ref m_GpuSortKeys);
+ 
+@@ -556,6 +797,7 @@ namespace GaussianSplatting.Runtime
+ 
+             m_SplatCount = 0;
+             m_GpuChunksValid = false;
++            m_SkinningEnabled = false;
+ 
+             editSelectedSplats = 0;
+             editDeletedSplats = 0;
+@@ -604,9 +846,80 @@ namespace GaussianSplatting.Runtime
+             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.SplatOpacityScale, m_OpacityScale);
+             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOrder, m_SHOrder);
+             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOnly, m_SHOnly ? 1 : 0);
++            // mono mode: compute uses Unity built-in VP/P matrices, write to first half of the buffer
++            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.UseEyeMatrices, 0);
++            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.ViewDataOffset, 0);
++
++            // Skinning
++            if (m_SkinningEnabled && m_GpuSkinWeights != null)
++            {
++                cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SkinWeightsValid, 1);
++                cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, Props.SplatWeights, m_GpuSkinWeights);
++                cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.BoneMatrixA, m_BoneMatrixA);
++                cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.BoneMatrixB, m_BoneMatrixB);
++            }
++            else
++            {
++                cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SkinWeightsValid, 0);
++                cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, Props.SplatWeights, m_GpuPosData);
++            }
+ 
+             m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcViewData, out uint gsX, out _, out _);
+-            cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_GpuView.count + (int)gsX - 1)/(int)gsX, 1, 1);
++            cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_SplatCount + (int)gsX - 1)/(int)gsX, 1, 1);
++        }
++
++        // Stereo XR variant of CalcViewData: uses explicit per-eye view/projection matrices instead of
++        // Unity's built-in (center-eye) UNITY_MATRIX_VP/P, and writes into the eye's half of the view buffer.
++        internal void CalcViewDataForEye(CommandBuffer cmb, Matrix4x4 viewMatrix, Matrix4x4 projMatrix, Vector3 eyePos, int viewDataOffset)
++        {
++            if (cmb == null) return;
++            var tr = transform;
++
++            Matrix4x4 matO2W = tr.localToWorldMatrix;
++            Matrix4x4 matW2O = tr.worldToLocalMatrix;
++            Matrix4x4 matMV = viewMatrix * matO2W;
++            // Match what Unity's UNITY_MATRIX_VP/P resolve to when rendering into a texture target.
++            Matrix4x4 gpuProj = GL.GetGPUProjectionMatrix(projMatrix, true);
++            Matrix4x4 matVP = gpuProj * viewMatrix;
++
++            int screenW = XRSettings.eyeTextureWidth, screenH = XRSettings.eyeTextureHeight;
++            if (screenW == 0) { screenW = Screen.width; screenH = Screen.height; }
++            Vector4 screenPar = new Vector4(screenW, screenH, 0, 0);
++
++            // calculate view dependent data for each splat
++            SetAssetDataOnCS(cmb, KernelIndices.CalcViewData);
++
++            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixMV, matMV);
++            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixObjectToWorld, matO2W);
++            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixWorldToObject, matW2O);
++            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixVPForEye, matVP);
++            cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixPForEye, gpuProj);
++
++            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.VecScreenParams, screenPar);
++            cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.VecWorldSpaceCameraPos, eyePos);
++            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.SplatScale, m_SplatScale);
++            cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.SplatOpacityScale, m_OpacityScale);
++            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOrder, m_SHOrder);
++            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOnly, m_SHOnly ? 1 : 0);
++            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.UseEyeMatrices, 1);
++            cmb.SetComputeIntParam(m_CSSplatUtilities, Props.ViewDataOffset, viewDataOffset);
++
++            // Skinning
++            if (m_SkinningEnabled && m_GpuSkinWeights != null)
++            {
++                cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SkinWeightsValid, 1);
++                cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, Props.SplatWeights, m_GpuSkinWeights);
++                cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.BoneMatrixA, m_BoneMatrixA);
++                cmb.SetComputeMatrixParam(m_CSSplatUtilities, Props.BoneMatrixB, m_BoneMatrixB);
++            }
++            else
++            {
++                cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SkinWeightsValid, 0);
++                cmb.SetComputeBufferParam(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, Props.SplatWeights, m_GpuPosData);
++            }
++
++            m_CSSplatUtilities.GetKernelThreadGroupSizes((int)KernelIndices.CalcViewData, out uint gsX, out _, out _);
++            cmb.DispatchCompute(m_CSSplatUtilities, (int)KernelIndices.CalcViewData, (m_SplatCount + (int)gsX - 1)/(int)gsX, 1, 1);
+         }
+ 
+         internal void SortPoints(CommandBuffer cmd, Camera cam, Matrix4x4 matrix)
+@@ -643,6 +956,7 @@ namespace GaussianSplatting.Runtime
+             var curHash = m_Asset ? m_Asset.dataHash : new Hash128();
+             if (m_PrevAsset != m_Asset || m_PrevHash != curHash)
+             {
++                //Debug.Log($"[GaussianSplatRenderer] Update on {name}: asset changed! Prev={m_PrevAsset != null}, New={m_Asset != null}, PrevHash={m_PrevHash}, NewHash={curHash}");
+                 m_PrevAsset = m_Asset;
+                 m_PrevHash = curHash;
+                 if (resourcesAreSetUp)
+@@ -997,7 +1311,7 @@ namespace GaussianSplatting.Runtime
+             ClearGraphicsBuffer(newEditSelectedMouseDown);
+             ClearGraphicsBuffer(newEditDeleted);
+ 
+-            var newGpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, newSplatCount, kGpuViewDataSize);
++            var newGpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, newSplatCount * 2, kGpuViewDataSize);
+             InitSortBuffers(newSplatCount);
+ 
+             // copy existing data over into new buffers
+@@ -1082,5 +1396,40 @@ namespace GaussianSplatting.Runtime
+         }
+ 
+         public GraphicsBuffer GpuEditDeleted => m_GpuEditDeleted;
++
++        // ── Public Skinning API ─────────────────────────────────────
++
++        /// <summary>
++        /// Enable LBS with per-splat skin weights and two bone matrices.
++        /// </summary>
++        /// <param name="weights">Per-splat blend weight [0,1] where 0 = BoneA, 1 = BoneB</param>
++        /// <param name="boneA">Primary bone world matrix</param>
++        /// <param name="boneB">Blend target bone world matrix</param>
++        public void SetSkinningData(float[] weights, Matrix4x4 boneA, Matrix4x4 boneB)
++        {
++            if (weights == null || weights.Length != m_SplatCount)
++            {
++                Debug.LogError($"[GaussianSplat] Skin weight count ({weights?.Length ?? 0}) != splat count ({m_SplatCount})");
++                return;
++            }
++
++            if (m_GpuSkinWeights == null || m_GpuSkinWeights.count != m_SplatCount)
++            {
++                DisposeBuffer(ref m_GpuSkinWeights);
++                m_GpuSkinWeights = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, 4);
++            }
++
++            m_GpuSkinWeights.SetData(weights);
++            m_BoneMatrixA = boneA;
++            m_BoneMatrixB = boneB;
++            m_SkinningEnabled = true;
++        }
++
++        /// <summary>Disable LBS and return to standard rigid transform.</summary>
++        public void ClearSkinningData()
++        {
++            m_SkinningEnabled = false;
++            DisposeBuffer(ref m_GpuSkinWeights);
++        }
+     }
+ }
+\ No newline at end of file
+diff --git a/package/Runtime/GaussianSplatURPFeature.cs b/package/Runtime/GaussianSplatURPFeature.cs
+index cab1747..6f552eb 100644
+--- a/package/Runtime/GaussianSplatURPFeature.cs
++++ b/package/Runtime/GaussianSplatURPFeature.cs
+@@ -10,13 +10,10 @@ using UnityEngine.Experimental.Rendering;
+ using UnityEngine.Rendering;
+ using UnityEngine.Rendering.Universal;
+ using UnityEngine.Rendering.RenderGraphModule;
++using UnityEngine.XR;
+ 
+ namespace GaussianSplatting.Runtime
+ {
+-    // Note: I have no idea what is the purpose of ScriptableRendererFeature vs ScriptableRenderPass, which one of those
+-    // is supposed to do resource management vs logic, etc. etc. Code below "seems to work" but I'm just fumbling along,
+-    // without understanding any of it.
+-    //
+     // ReSharper disable once InconsistentNaming
+     class GaussianSplatURPFeature : ScriptableRendererFeature
+     {
+@@ -28,12 +25,22 @@ namespace GaussianSplatting.Runtime
+             static readonly ProfilingSampler s_profilingSampler = new(ProfilerTag);
+             static readonly int s_gaussianSplatRT = Shader.PropertyToID(GaussianSplatRTName);
+ 
++            internal Matrix4x4 m_PrevMatrixMV = Matrix4x4.identity;
++
+             class PassData
+             {
+                 internal UniversalCameraData CameraData;
+                 internal TextureHandle SourceTexture;
+                 internal TextureHandle SourceDepth;
+-                internal TextureHandle GaussianSplatRT;
++                internal TextureHandle GaussianSplatRT;       // mono path
++                internal TextureHandle GaussianSplatRTEye0;   // stereo path: left eye
++                internal TextureHandle GaussianSplatRTEye1;   // stereo path: right eye
++                internal TextureHandle DepthCopy;
++                internal Matrix4x4 PrevMatrixMV;
++                internal int RTWidth;
++                internal int RTHeight;
++                internal int NumEyes;
++                internal bool IsStereo;
+             }
+ 
+             public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
+@@ -47,26 +54,142 @@ namespace GaussianSplatting.Runtime
+                 rtDesc.depthBufferBits = 0;
+                 rtDesc.msaaSamples = 1;
+                 rtDesc.graphicsFormat = GraphicsFormat.R16G16B16A16_SFloat;
+-                var textureHandle = UniversalRenderer.CreateRenderGraphTexture(renderGraph, rtDesc, GaussianSplatRTName, true);
++                // Force flat 2D: the camera descriptor may inherit Tex2DArray from SPI stereo,
++                // but our intermediate per-eye RTs are independent single-plane textures.
++                rtDesc.dimension = TextureDimension.Tex2D;
++                rtDesc.volumeDepth = 1;
++                // Clamp to XR eye texture size so each per-eye RT is the native headset resolution
++                // and _ScreenParams auto-resolves correctly without manual overrides.
++                if (XRSettings.eyeTextureWidth > 0)
++                {
++                    rtDesc.width  = (int)XRSettings.eyeTextureWidth;
++                    rtDesc.height = (int)XRSettings.eyeTextureHeight;
++                }
++
++                bool isStereo = cameraData.camera.stereoEnabled;
++                int numEyes = isStereo ? 2 : 1;
++
++                TextureHandle rtMain = TextureHandle.nullHandle;
++                TextureHandle rtEye0 = TextureHandle.nullHandle;
++                TextureHandle rtEye1 = TextureHandle.nullHandle;
++
++                if (isStereo)
++                {
++                    rtEye0 = UniversalRenderer.CreateRenderGraphTexture(renderGraph, rtDesc, "_GaussianSplatRTEye0", true);
++                    rtEye1 = UniversalRenderer.CreateRenderGraphTexture(renderGraph, rtDesc, "_GaussianSplatRTEye1", true);
++                }
++                else
++                {
++                    rtMain = UniversalRenderer.CreateRenderGraphTexture(renderGraph, rtDesc, GaussianSplatRTName, true);
++                }
+ 
+                 passData.CameraData = cameraData;
+                 passData.SourceTexture = resourceData.activeColorTexture;
+                 passData.SourceDepth = resourceData.activeDepthTexture;
+-                passData.GaussianSplatRT = textureHandle;
++                passData.DepthCopy = resourceData.activeDepthTexture;
++                passData.PrevMatrixMV = m_PrevMatrixMV;
++                passData.GaussianSplatRT = rtMain;
++                passData.GaussianSplatRTEye0 = rtEye0;
++                passData.GaussianSplatRTEye1 = rtEye1;
++                passData.RTWidth = rtDesc.width;
++                passData.RTHeight = rtDesc.height;
++                passData.NumEyes = numEyes;
++                passData.IsStereo = isStereo;
+ 
+                 builder.UseTexture(resourceData.activeColorTexture, AccessFlags.ReadWrite);
+                 builder.UseTexture(resourceData.activeDepthTexture);
+-                builder.UseTexture(textureHandle, AccessFlags.Write);
++                if (isStereo)
++                {
++                    builder.UseTexture(rtEye0, AccessFlags.Write);
++                    builder.UseTexture(rtEye1, AccessFlags.Write);
++                }
++                else
++                {
++                    builder.UseTexture(rtMain, AccessFlags.Write);
++                }
+                 builder.AllowPassCulling(false);
+                 builder.SetRenderFunc(static (PassData data, UnsafeGraphContext context) =>
+                 {
+                     var commandBuffer = CommandBufferHelpers.GetNativeCommandBuffer(context.cmd);
+                     using var _ = new ProfilingScope(commandBuffer, s_profilingSampler);
+-                    commandBuffer.SetGlobalTexture(s_gaussianSplatRT, data.GaussianSplatRT);
+-                    CoreUtils.SetRenderTarget(commandBuffer, data.GaussianSplatRT, data.SourceDepth, ClearFlag.Color, Color.clear);
+-                    Material matComposite = GaussianSplatRenderSystem.instance.SortAndRenderSplats(data.CameraData.camera, commandBuffer);
++                    commandBuffer.SetGlobalTexture("_CameraDepthTexture", data.DepthCopy);
++                    commandBuffer.SetGlobalTexture("_VirtualDepthTex", data.DepthCopy);
++
++                    var cam = data.CameraData.camera;
++                    Material matComposite = null;
++
++                    // No Y-flip compensation for either mono or stereo: under Unity 6
++                    // RenderGraph the composite always blits into an intermediate texture
++                    // (activeColorTexture) — never the backbuffer — so the legacy
++                    // backbuffer heuristic (GPU-projection m11 mismatch, which is ALWAYS
++                    // true on D3D regardless of the actual target) never applies here.
++                    // That heuristic used to make Game-view cameras render splats upside
++                    // down in the editor while device (stereo) and scene view (excluded by
++                    // camera type) were correct. The built-in render pipeline path
++                    // (GaussianSplatRenderer.cs) legitimately still varies this, since it
++                    // composites directly to BuiltinRenderTextureType.CameraTarget.
++                    commandBuffer.SetGlobalFloat(GaussianSplatRenderer.Props.SplatFlipY, 0.0f);
++
++                    if (data.IsStereo)
++                    {
++                        for (int eye = 0; eye < 2; eye++)
++                        {
++                            // Each eye renders to its own single-size RT, which means
++                            // _ScreenParams and _CameraTargetTexture both auto-resolve to
++                            // the correct per-eye dimensions – no manual overrides needed.
++                            RenderTargetIdentifier eyeRT = eye == 0
++                                ? (RenderTargetIdentifier)data.GaussianSplatRTEye0
++                                : (RenderTargetIdentifier)data.GaussianSplatRTEye1;
++                            CoreUtils.SetRenderTarget(commandBuffer, eyeRT, ClearFlag.Color, Color.clear);
++                            commandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.CameraTargetTexture, eyeRT);
++
++                            Matrix4x4 viewMatrix = cam.GetStereoViewMatrix((Camera.StereoscopicEye)eye);
++                            Matrix4x4 projMatrix = cam.GetStereoProjectionMatrix((Camera.StereoscopicEye)eye);
++                            Matrix4x4 invView = viewMatrix.inverse;
++                            Vector3 eyePos = new Vector3(invView.m03, invView.m13, invView.m23);
++
++                            matComposite = GaussianSplatRenderSystem.instance.SortAndRenderSplatsForEye(
++                                cam, commandBuffer, eye, viewMatrix, projMatrix, eyePos);
++                        }
++
++                    }
++                    else
++                    {
++                        commandBuffer.SetGlobalTexture(GaussianSplatRenderer.Props.CameraTargetTexture, data.GaussianSplatRT);
++                        CoreUtils.SetRenderTarget(commandBuffer, data.GaussianSplatRT, data.SourceDepth, ClearFlag.Color, Color.clear);
++                        commandBuffer.SetGlobalTexture(s_gaussianSplatRT, data.GaussianSplatRT);
++
++                        matComposite = GaussianSplatRenderSystem.instance.SortAndRenderSplats(cam, commandBuffer);
++                    }
++
++                    commandBuffer.SetGlobalMatrix("_PrevMatrixMV", data.PrevMatrixMV);
++                    commandBuffer.SetGlobalTexture("_CameraMotionVectorsTexture", data.DepthCopy);
++
+                     commandBuffer.BeginSample(GaussianSplatRenderSystem.s_ProfCompose);
+-                    Blitter.BlitCameraTexture(commandBuffer, data.GaussianSplatRT, data.SourceTexture, matComposite, 0);
++                    if (data.IsStereo)
++                    {
++                        // Blitter always issues a single-instance fullscreen triangle, so
++                        // unity_StereoEyeIndex is never 1 inside the composite fragment
++                        // shader — a branch on it would composite eye 0 into both eyes.
++                        // Composite each eye explicitly instead: bind that eye's splat RT
++                        // and target the matching slice of the single-pass-instanced
++                        // Tex2DArray camera colour target.
++                        for (int eye = 0; eye < 2; eye++)
++                        {
++                            var eyeRT = eye == 0 ? data.GaussianSplatRTEye0 : data.GaussianSplatRTEye1;
++                            commandBuffer.SetGlobalTexture(s_gaussianSplatRT, eyeRT);
++                            // No clear: the composite blends splats over the scene colour
++                            // already in this slice (Blend SrcAlpha OneMinusSrcAlpha).
++                            commandBuffer.SetRenderTarget((RenderTargetIdentifier)data.SourceTexture,
++                                0, CubemapFace.Unknown, eye);
++                            Blitter.BlitTexture(commandBuffer, eyeRT, new Vector4(1, 1, 0, 0), matComposite, 0);
++                        }
++                    }
++                    else
++                    {
++                        Blitter.BlitCameraTexture(commandBuffer, data.GaussianSplatRT,
++                            data.SourceTexture, matComposite, 0);
++                    }
+                     commandBuffer.EndSample(GaussianSplatRenderSystem.s_ProfCompose);
+                 });
+             }
+@@ -74,11 +197,16 @@ namespace GaussianSplatting.Runtime
+ 
+         GSRenderPass m_Pass;
+         bool m_HasCamera;
++        Matrix4x4 m_LastFrameMatrixMV = Matrix4x4.identity;
+ 
+         public override void Create()
+         {
+             m_Pass = new GSRenderPass
+             {
++                // Composite splats before Unity draws transparent/overlay geometry.
++                // FK preview markers use the Overlay queue and ZTest Always, so they
++                // must be submitted after this fullscreen composite or the composite
++                // simply paints over them regardless of their depth state.
+                 renderPassEvent = RenderPassEvent.BeforeRenderingTransparents
+             };
+         }
+@@ -91,12 +219,16 @@ namespace GaussianSplatting.Runtime
+                 return;
+ 
+             m_HasCamera = true;
++            // Pass last frame's MV matrix for motion vectors
++            m_Pass.m_PrevMatrixMV = m_LastFrameMatrixMV;
++            m_LastFrameMatrixMV = cameraData.camera.worldToCameraMatrix;
+         }
+ 
+         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
+         {
+             if (!m_HasCamera)
+                 return;
++
+             renderer.EnqueuePass(m_Pass);
+         }
+ 
+diff --git a/package/Runtime/GpuSorting.cs b/package/Runtime/GpuSorting.cs
+index 2d86832..85bc105 100644
+--- a/package/Runtime/GpuSorting.cs
++++ b/package/Runtime/GpuSorting.cs
+@@ -170,7 +170,7 @@ namespace GaussianSplatting.Runtime
+ 
+             //Clear the global histogram
+             cmd.SetComputeBufferParam(m_CS, m_kernelInitDeviceRadixSort, "b_globalHist", args.resources.globalHistBuffer);
+-            cmd.DispatchCompute(m_CS, m_kernelInitDeviceRadixSort, 1, 1, 1);
++            cmd.DispatchCompute(m_CS, m_kernelInitDeviceRadixSort, 4, 1, 1);
+ 
+             // Execute the sort algorithm in 8-bit increments
+             for (constants.radixShift = 0; constants.radixShift < 32; constants.radixShift += DEVICE_RADIX_SORT_BITS)
+diff --git a/package/Shaders/DeviceRadixSort.hlsl b/package/Shaders/DeviceRadixSort.hlsl
+index b055fb6..3d226fc 100644
+--- a/package/Shaders/DeviceRadixSort.hlsl
++++ b/package/Shaders/DeviceRadixSort.hlsl
+@@ -39,10 +39,11 @@ groupshared uint g_scan[SCAN_DIM];  //Shared memory for the scan
+ //INIT KERNEL
+ //*****************************************************************************
+ //Clear the global histogram, as we will be adding to it atomically
+-[numthreads(1024, 1, 1)]
+-void InitDeviceRadixSort(int3 id : SV_DispatchThreadID)
++[numthreads(256, 1, 1)]
++void InitDeviceRadixSort(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+ {
+-    b_globalHist[id.x] = 0;
++    uint id = gtid.x + gid.x * 256;
++    b_globalHist[id] = 0;
+ }
+ 
+ //*****************************************************************************
+diff --git a/package/Shaders/GaussianComposite.shader b/package/Shaders/GaussianComposite.shader
+index 7a953ab..531ca47 100644
+--- a/package/Shaders/GaussianComposite.shader
++++ b/package/Shaders/GaussianComposite.shader
+@@ -3,41 +3,63 @@ Shader "Hidden/Gaussian Splatting/Composite"
+ {
+     SubShader
+     {
++        Tags { "RenderType" = "Opaque" "RenderPipeline" = "UniversalPipeline"}
+         Pass
+         {
++            Name "GaussianComposite"
+             ZWrite Off
+             ZTest Always
+             Cull Off
+             Blend SrcAlpha OneMinusSrcAlpha
+ 
+-CGPROGRAM
+-#pragma vertex vert
+-#pragma fragment frag
+-#pragma require compute
+-#pragma use_dxc
+-#include "UnityCG.cginc"
++            HLSLPROGRAM
++            #pragma vertex Vert
++            #pragma fragment frag
++            #pragma require compute
++            #pragma use_dxc
++            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
++            #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
++            #include "Packages/com.unity.render-pipelines.core/Runtime/Utilities/Blit.hlsl"
+ 
+-struct v2f
+-{
+-    float4 vertex : SV_POSITION;
+-};
++            TEXTURE2D(_GaussianSplatRT);
++            SAMPLER(sampler_GaussianSplatRT);
++            float _SplatFlipY;
+ 
+-v2f vert (uint vtxID : SV_VertexID)
+-{
+-    v2f o;
+-    float2 quadPos = float2(vtxID&1, (vtxID>>1)&1) * 4.0 - 1.0;
+-	o.vertex = float4(quadPos, 1, 1);
+-    return o;
+-}
++            half4 frag (Varyings input) : SV_Target
++            {
++                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
+ 
+-Texture2D _GaussianSplatRT;
++                float2 uv = input.texcoord;
++                #if UNITY_UV_STARTS_AT_TOP
++                if (_SplatFlipY > 0.5)
++                {
++                    if (_BlitScaleBias.y > 0.0)
++                        uv.y = 1.0 - uv.y;
++                }
++                #endif
+ 
+-half4 frag (v2f i) : SV_Target
+-{
+-    half4 col = _GaussianSplatRT.Load(int3(i.vertex.xy, 0));
+-    return float4(GammaToLinearSpace(col.rgb/col.a),col.a);
+-}
+-ENDCG
++                // In stereo the C# side runs this composite once per eye, binding that
++                // eye's splat RT to _GaussianSplatRT and targeting the matching slice of
++                // the SPI array target. Branching on unity_StereoEyeIndex here does not
++                // work: Blitter draws a single non-instanced triangle, so the eye index
++                // is always 0 and both eyes would receive the left eye's splats.
++                half4 col = SAMPLE_TEXTURE2D(_GaussianSplatRT, sampler_GaussianSplatRT, uv);
++
++                half3 rgb = col.a > 0.00001 ? col.rgb / col.a : 0.0;
++
++                // 3DGS SH colors are sRGB-encoded (training compares SH*0.282+0.5
++                // directly against sRGB photos). The camera color target is LINEAR
++                // in this project, so convert before blending — otherwise colors get
++                // sRGB-encoded twice by display time and splats render washed-out
++                // grey (a black object at sRGB~0.1 displays as ~0.35 grey).
++                // Upstream aras-p's composite has this conversion; keep it.
++                #if !UNITY_COLORSPACE_GAMMA
++                rgb = SRGBToLinear(rgb);
++                #endif
++
++                return half4(rgb, col.a);
++            }
++            ENDHLSL
+         }
+     }
+ }
+diff --git a/package/Shaders/GaussianSplatting.hlsl b/package/Shaders/GaussianSplatting.hlsl
+index 2124d39..7a9e4bd 100644
+--- a/package/Shaders/GaussianSplatting.hlsl
++++ b/package/Shaders/GaussianSplatting.hlsl
+@@ -625,11 +625,13 @@ struct SplatViewData
+ // property of the texture will get set to (1,1,1,1).
+ //
+ // One could hope someday Unity will fix all this upside-down thingy...
++#ifndef SHADER_STAGE_COMPUTE
+ float4 _CameraTargetTexture_TexelSize;
+ void FlipProjectionIfBackbuffer(inout float4 vpos)
+ {
+     if (_CameraTargetTexture_TexelSize.z == 1.0)
+         vpos.y = -vpos.y;
+ }
++#endif
+ 
+ #endif // GAUSSIAN_SPLATTING_HLSL
+diff --git a/package/Shaders/RenderGaussianSplats.shader b/package/Shaders/RenderGaussianSplats.shader
+index 540a9f5..4c3f1ed 100644
+--- a/package/Shaders/RenderGaussianSplats.shader
++++ b/package/Shaders/RenderGaussianSplats.shader
+@@ -31,12 +31,13 @@ struct v2f
+ StructuredBuffer<SplatViewData> _SplatViewData;
+ ByteAddressBuffer _SplatSelectedBits;
+ uint _SplatBitsValid;
++uint _ViewDataOffset; // stereo XR: per-eye offset into the (doubled) view-data buffer
+ 
+ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
+ {
+     v2f o = (v2f)0;
+     instID = _OrderBuffer[instID];
+-	SplatViewData view = _SplatViewData[instID];
++	SplatViewData view = _SplatViewData[instID + _ViewDataOffset];
+ 	float4 centerClipPos = view.pos;
+ 	bool behindCam = centerClipPos.w <= 0;
+ 	if (behindCam)
+diff --git a/package/Shaders/SortCommon.hlsl b/package/Shaders/SortCommon.hlsl
+index bdc18b9..48d5891 100644
+--- a/package/Shaders/SortCommon.hlsl
++++ b/package/Shaders/SortCommon.hlsl
+@@ -249,7 +249,7 @@ inline void LoadDummyKey(inout uint key)
+ inline KeyStruct LoadKeysWGE16(uint gtid, uint waveSize, uint partIndex)
+ {
+     KeyStruct keys;
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = DeviceOffsetWGE16(gtid, waveSize, partIndex);
+         i < KEYS_PER_THREAD;
+         ++i, t += waveSize)
+@@ -262,7 +262,7 @@ inline KeyStruct LoadKeysWGE16(uint gtid, uint waveSize, uint partIndex)
+ inline KeyStruct LoadKeysWLT16(uint gtid, uint waveSize, uint partIndex, uint serialIterations)
+ {
+     KeyStruct keys;
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = DeviceOffsetWLT16(gtid, waveSize, partIndex, serialIterations);
+         i < KEYS_PER_THREAD;
+         ++i, t += waveSize * serialIterations)
+@@ -275,7 +275,7 @@ inline KeyStruct LoadKeysWLT16(uint gtid, uint waveSize, uint partIndex, uint se
+ inline KeyStruct LoadKeysPartialWGE16(uint gtid, uint waveSize, uint partIndex)
+ {
+     KeyStruct keys;
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = DeviceOffsetWGE16(gtid, waveSize, partIndex);
+         i < KEYS_PER_THREAD;
+         ++i, t += waveSize)
+@@ -291,7 +291,7 @@ inline KeyStruct LoadKeysPartialWGE16(uint gtid, uint waveSize, uint partIndex)
+ inline KeyStruct LoadKeysPartialWLT16(uint gtid, uint waveSize, uint partIndex, uint serialIterations)
+ {
+     KeyStruct keys;
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = DeviceOffsetWLT16(gtid, waveSize, partIndex, serialIterations);
+         i < KEYS_PER_THREAD;
+         ++i, t += waveSize * serialIterations)
+@@ -316,7 +316,7 @@ inline uint WaveFlagsWLT16(uint waveSize)
+ 
+ inline void WarpLevelMultiSplitWGE16(uint key, inout uint4 waveFlags)
+ {
+-    [unroll]
++// [unroll]
+     for (uint k = 0; k < RADIX_LOG; ++k)
+     {
+         const uint currentBit = 1 << k + e_radixShift;
+@@ -352,7 +352,7 @@ inline uint2 CountBitsWGE16(uint waveSize, uint ltMask, uint4 waveFlags)
+ 
+ inline void WarpLevelMultiSplitWLT16(uint key, inout uint waveFlags)
+ {
+-    [unroll]
++// [unroll]
+     for (uint k = 0; k < RADIX_LOG; ++k)
+     {
+         const bool t = key >> (k + e_radixShift) & 1;
+@@ -369,7 +369,7 @@ inline OffsetStruct RankKeysWGE16(
+     const uint initialFlags = WaveFlagsWGE16(waveSize);
+     const uint ltMask = (1U << (WaveGetLaneIndex() & 31)) - 1;
+     
+-    [unroll]
++// [unroll]
+     for (uint i = 0; i < KEYS_PER_THREAD; ++i)
+     {
+         uint4 waveFlags = initialFlags;
+@@ -394,7 +394,7 @@ inline OffsetStruct RankKeysWLT16(uint waveSize, uint waveIndex, KeyStruct keys,
+     const uint ltMask = (1U << WaveGetLaneIndex()) - 1;
+     const uint initialFlags = WaveFlagsWLT16(waveSize);
+     
+-    [unroll]
++// [unroll]
+     for (uint i = 0; i < KEYS_PER_THREAD; ++i)
+     {
+         uint waveFlags = initialFlags;
+@@ -516,7 +516,7 @@ inline void UpdateOffsetsWGE16(
+     if (gtid >= waveSize)
+     {
+         const uint t = getWaveIndex(gtid, waveSize) * RADIX;
+-        [unroll]
++    // [unroll]
+         for (uint i = 0; i < KEYS_PER_THREAD; ++i)
+         {
+             const uint t2 = ExtractDigit(keys.k[i]);
+@@ -525,7 +525,7 @@ inline void UpdateOffsetsWGE16(
+     }
+     else
+     {
+-        [unroll]
++    // [unroll]
+         for (uint i = 0; i < KEYS_PER_THREAD; ++i)
+             offsets.o[i] += g_d[ExtractDigit(keys.k[i])];
+     }
+@@ -541,7 +541,7 @@ inline void UpdateOffsetsWLT16(
+     if (gtid >= waveSize * serialIterations)
+     {
+         const uint t = getWaveIndex(gtid, waveSize) / serialIterations * HALF_RADIX;
+-        [unroll]
++    // [unroll]
+         for (uint i = 0; i < KEYS_PER_THREAD; ++i)
+         {
+             const uint t2 = ExtractPackedIndex(keys.k[i]);
+@@ -550,7 +550,7 @@ inline void UpdateOffsetsWLT16(
+     }
+     else
+     {
+-        [unroll]
++    // [unroll]
+         for (uint i = 0; i < KEYS_PER_THREAD; ++i)
+             offsets.o[i] += ExtractPackedValue(g_d[ExtractPackedIndex(keys.k[i])], keys.k[i]);
+     }
+@@ -558,7 +558,7 @@ inline void UpdateOffsetsWLT16(
+ 
+ inline void ScatterKeysShared(OffsetStruct offsets, KeyStruct keys)
+ {
+-    [unroll]
++// [unroll]
+     for (uint i = 0; i < KEYS_PER_THREAD; ++i)
+         g_d[offsets.o[i]] = keys.k[i];
+ }
+@@ -641,7 +641,7 @@ inline void ScatterPairsKeyPhaseAscending(
+     uint gtid,
+     inout DigitStruct digits)
+ {
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = gtid; i < KEYS_PER_THREAD; ++i, t += D_DIM)
+     {
+         digits.d[i] = ExtractDigit(g_d[t]);
+@@ -655,7 +655,7 @@ inline void ScatterPairsKeyPhaseDescending(
+ {
+     if (e_radixShift == 24)
+     {
+-        [unroll]
++    // [unroll]
+         for (uint i = 0, t = gtid; i < KEYS_PER_THREAD; ++i, t += D_DIM)
+         {
+             digits.d[i] = ExtractDigit(g_d[t]);
+@@ -674,7 +674,7 @@ inline void LoadPayloadsWGE16(
+     uint partIndex,
+     inout KeyStruct payloads)
+ {
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = DeviceOffsetWGE16(gtid, waveSize, partIndex);
+         i < KEYS_PER_THREAD;
+         ++i, t += waveSize)
+@@ -690,7 +690,7 @@ inline void LoadPayloadsWLT16(
+     uint serialIterations,
+     inout KeyStruct payloads)
+ {
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = DeviceOffsetWLT16(gtid, waveSize, partIndex, serialIterations);
+         i < KEYS_PER_THREAD;
+         ++i, t += waveSize * serialIterations)
+@@ -701,7 +701,7 @@ inline void LoadPayloadsWLT16(
+ 
+ inline void ScatterPayloadsAscending(uint gtid, DigitStruct digits)
+ {
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = gtid; i < KEYS_PER_THREAD; ++i, t += D_DIM)
+         WritePayload(g_d[digits.d[i] + PART_SIZE] + t, t);
+ }
+@@ -710,7 +710,7 @@ inline void ScatterPayloadsDescending(uint gtid, DigitStruct digits)
+ {
+     if (e_radixShift == 24)
+     {
+-        [unroll]
++    // [unroll]
+         for (uint i = 0, t = gtid; i < KEYS_PER_THREAD; ++i, t += D_DIM)
+             WritePayload(DescendingIndex(g_d[digits.d[i] + PART_SIZE] + t), t);
+     }
+@@ -811,7 +811,7 @@ inline void ScatterPairsKeyPhaseAscendingPartial(
+     uint finalPartSize,
+     inout DigitStruct digits)
+ {
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = gtid; i < KEYS_PER_THREAD; ++i, t += D_DIM)
+     {
+         if (t < finalPartSize)
+@@ -829,7 +829,7 @@ inline void ScatterPairsKeyPhaseDescendingPartial(
+ {
+     if (e_radixShift == 24)
+     {
+-        [unroll]
++    // [unroll]
+         for (uint i = 0, t = gtid; i < KEYS_PER_THREAD; ++i, t += D_DIM)
+         {
+             if (t < finalPartSize)
+@@ -851,7 +851,7 @@ inline void LoadPayloadsPartialWGE16(
+     uint partIndex,
+     inout KeyStruct payloads)
+ {
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = DeviceOffsetWGE16(gtid, waveSize, partIndex);
+         i < KEYS_PER_THREAD;
+         ++i, t += waveSize)
+@@ -868,7 +868,7 @@ inline void LoadPayloadsPartialWLT16(
+     uint serialIterations,
+     inout KeyStruct payloads)
+ {
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = DeviceOffsetWLT16(gtid, waveSize, partIndex, serialIterations);
+         i < KEYS_PER_THREAD;
+         ++i, t += waveSize * serialIterations)
+@@ -883,7 +883,7 @@ inline void ScatterPayloadsAscendingPartial(
+     uint finalPartSize,
+     DigitStruct digits)
+ {
+-    [unroll]
++// [unroll]
+     for (uint i = 0, t = gtid; i < KEYS_PER_THREAD; ++i, t += D_DIM)
+     {
+         if (t < finalPartSize)
+@@ -898,7 +898,7 @@ inline void ScatterPayloadsDescendingPartial(
+ {
+     if (e_radixShift == 24)
+     {
+-        [unroll]
++    // [unroll]
+         for (uint i = 0, t = gtid; i < KEYS_PER_THREAD; ++i, t += D_DIM)
+         {
+             if (t < finalPartSize)
+diff --git a/package/Shaders/SplatUtilities.compute b/package/Shaders/SplatUtilities.compute
+index 77241da..47f23c7 100644
+--- a/package/Shaders/SplatUtilities.compute
++++ b/package/Shaders/SplatUtilities.compute
+@@ -44,6 +44,20 @@ float4 _VecScreenParams;
+ float4 _VecWorldSpaceCameraPos;
+ int _SelectionMode;
+ 
++// ── Stereo XR (per-eye rendering) ──────────────────────────────
++// When _UseEyeMatrices is set, CSCalcViewData uses these explicit per-eye matrices instead of the
++// built-in (center-eye) UNITY_MATRIX_VP/P, and writes results offset by _ViewDataOffset.
++float4x4 _MatrixVPForEye;
++float4x4 _MatrixPForEye;
++uint _ViewDataOffset;
++uint _UseEyeMatrices;
++
++// ── Linear Blend Skinning (LBS) ────────────────────────────────
++float4x4 _BoneMatrixA;
++float4x4 _BoneMatrixB;
++StructuredBuffer<float> _SplatWeights;
++uint _SkinWeightsValid;
++
+ RWStructuredBuffer<uint> _SplatSortDistances;
+ RWStructuredBuffer<uint> _SplatSortKeys;
+ uint _SplatCount;
+@@ -195,9 +209,23 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
+ 
+     SplatData splat = LoadSplatData(idx);
+     SplatViewData view = (SplatViewData)0;
+-    
+-    float3 centerWorldPos = mul(_MatrixObjectToWorld, float4(splat.pos,1)).xyz;
+-    float4 centerClipPos = mul(UNITY_MATRIX_VP, float4(centerWorldPos, 1));
++
++    // ── LBS bone blending ──────────────────────────────────────
++    float3 centerWorldPos;
++    if (_SkinWeightsValid)
++    {
++        float w = _SplatWeights[idx];
++        float3 posA = mul(_BoneMatrixA, float4(splat.pos, 1)).xyz;
++        float3 posB = mul(_BoneMatrixB, float4(splat.pos, 1)).xyz;
++        centerWorldPos = lerp(posA, posB, w);
++    }
++    else
++    {
++        centerWorldPos = mul(_MatrixObjectToWorld, float4(splat.pos,1)).xyz;
++    }
++    float4x4 mtxVP = _UseEyeMatrices ? _MatrixVPForEye : UNITY_MATRIX_VP;
++    float4x4 mtxP  = _UseEyeMatrices ? _MatrixPForEye  : UNITY_MATRIX_P;
++    float4 centerClipPos = mul(mtxVP, float4(centerWorldPos, 1));
+     half opacityScale = _SplatOpacityScale;
+     float splatScale = _SplatScale;
+ 
+@@ -233,7 +261,7 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
+         float splatScale2 = splatScale * splatScale;
+         cov3d0 *= splatScale2;
+         cov3d1 *= splatScale2;
+-        float3 cov2d = CalcCovariance2D(splat.pos, cov3d0, cov3d1, _MatrixMV, UNITY_MATRIX_P, _VecScreenParams);
++        float3 cov2d = CalcCovariance2D(splat.pos, cov3d0, cov3d1, _MatrixMV, mtxP, _VecScreenParams);
+         
+         DecomposeCovariance(cov2d, view.axis1, view.axis2);
+ 
+@@ -248,7 +276,7 @@ void CSCalcViewData (uint3 id : SV_DispatchThreadID)
+         view.color.y = (f32tof16(col.b) << 16) | f32tof16(col.a);
+     }
+     
+-    _SplatViewData[idx] = view;
++    _SplatViewData[idx + _ViewDataOffset] = view;
+ }
+ 
+ 
